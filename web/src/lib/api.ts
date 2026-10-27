@@ -157,16 +157,18 @@ async function httpInner<T>(path: string, init: RequestInit | undefined, retried
   return r.json();
 }
 
-// sseUrl builds a URL for Server-Sent Events streams. SSE must NOT go through the
-// Next.js dev `/api` rewrite: that proxy buffers the streamed response, so event
-// frames never reach the browser (the EventSource opens but receives 0 messages).
-// We therefore connect straight to the Go backend, whose CORS is open. Override
-// with NEXT_PUBLIC_SSE_BASE; set it to "" to force same-origin (e.g. behind a
-// production reverse proxy that flushes SSE correctly).
-// 凭据(F6):先 POST /api/sse-ticket(走 /api 代理,带 Authorization 头)换 60s
-// 一次性 ticket 再拼 ?ticket=——access token 不再出现在 URL/访问日志里。ticket
-// 用后即焚,所以 EventSource 自带的自动重连会在第二次握手时 401;调用点必须在
-// 连接彻底关闭(readyState === CLOSED)后重新走一遍本函数换票重连。
+// sseUrl builds a URL for Server-Sent Events streams.
+//
+// The process listen address is chosen at startup (-addr) and can be any port.
+// The page is already being served from that address, so the stream uses
+// window.location.origin and never a fixed port. NEXT_PUBLIC_SSE_BASE overrides
+// this when the UI and the API are on different origins (next dev: the dev
+// server proxies /api but buffers the event stream). An empty value means the
+// page origin.
+// 凭据(F6):先 POST /api/sse-ticket(带 Authorization 头)换 60s 一次性 ticket
+// 再拼 ?ticket=——access token 不再出现在 URL/访问日志里。ticket 用后即焚,
+// 浏览器用同一条 URL 自动重连会 401。调用点必须先 close() 这条连接,再重新
+// 走一遍本函数换票。
 // mockReport returns a canned Markdown report for the demo.
 function mockReport(_task?: string): string {
   return `# ARTEX 渗透测试报告 — Acme Corp
@@ -191,9 +193,8 @@ function mockReport(_task?: string): string {
 }
 
 export async function sseUrl(path: string): Promise<string> {
-  const base =
-    process.env.NEXT_PUBLIC_SSE_BASE ??
-    (typeof window !== "undefined" ? `${window.location.protocol}//${window.location.hostname}:8787` : "");
+  const configured = process.env.NEXT_PUBLIC_SSE_BASE?.replace(/\/$/, "");
+  const base = configured || (typeof window !== "undefined" ? window.location.origin : "");
   const { ticket } = await post<{ ticket: string }>("/sse-ticket");
   const sep = path.includes("?") ? "&" : "?";
   return `${base}${path}${sep}ticket=${encodeURIComponent(ticket)}`;
@@ -379,7 +380,14 @@ export const api = {
       by_type: { type: string; total: number; tested: number }[];
     }>(`/tasks/${id}/coverage`),
   // 资产覆盖图：范围内全部资产 + 连接用的根域名/公司节点，含 tested/in_scope。
-  taskCoverageGraph: (id: string) => get<CoverageGraphData>(`/tasks/${id}/coverage-graph`),
+  taskCoverageGraph: (id: string, opts?: { fold?: boolean }) => {
+    const fold = opts?.fold === false ? "0" : "1";
+    return get<CoverageGraphData>(`/tasks/${id}/coverage-graph?fold=${fold}`);
+  },
+  explorationGraphRevision: (task?: string) =>
+    get<{ node_count: number; edge_count: number; max_node_id: number; max_edge_key: number }>(
+      `/exploration/graph/revision${tq(task)}`,
+    ),
   // 全局 llm_usage 聚合（仪表盘新版 token 视图）：按 profile 总量 + 按天分桶。
   usageStats: (days = 365) => get<UsageStats>(`/tokens/usage?days=${days}`),
   // ---- 目标管理（总览）----

@@ -219,22 +219,28 @@ function TaskDetailInner() {
       .catch(() => setProfiles([]));
   }, []);
 
+  const terminalRef = React.useRef(false);
+
   React.useEffect(() => {
     let alive = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const load = () =>
       api
-        .interceptTask(id)
-        .then((rows) => {
-          if (alive) setInterceptPendingCount(rows.filter((r) => r.status === "pending").length);
+        .interceptTaskPage(id, 1, 1, { status: "pending" })
+        .then((r) => {
+          if (alive) setInterceptPendingCount(r.total);
         })
         .catch(() => {
           // Polling is best-effort; the next interval retries automatically.
+        })
+        .finally(() => {
+          if (!alive) return;
+          timer = setTimeout(load, terminalRef.current ? 30_000 : 5000);
         });
     void load();
-    const t = setInterval(load, 5000);
     return () => {
       alive = false;
-      clearInterval(t);
+      if (timer) clearTimeout(timer);
     };
   }, [id]);
 
@@ -242,20 +248,24 @@ function TaskDetailInner() {
   const load = React.useCallback(() => {
     if (taskLoadInFlight.current === id) return;
     taskLoadInFlight.current = id;
-    Promise.all([api.task(id), api.stats(id).catch(() => null)])
-      .then(([task, s]) => {
+    // Paint the header as soon as task() returns; stats fill engine fields later.
+    api
+      .task(id)
+      .then((next) => {
         if (taskLoadInFlight.current !== id) return;
-        const base = { ...task };
-        const at = s?.active_task;
-        if (at) {
-          base.in_flight = at.in_flight;
-          base.goals_total = at.goals_total;
-          base.goals_met = at.goals_met;
-          base.engine_mode = s?.engine_mode ?? at.engine_mode;
-          base.paused = at.paused;
-        }
-        setTask(base);
-        setPaused(at?.paused ?? base.paused ?? false);
+        terminalRef.current = ["done", "failed", "timeout"].includes(next.status);
+        setTask((prev) => {
+          if (!prev || prev.id !== next.id) return next;
+          return {
+            ...next,
+            in_flight: prev.in_flight,
+            goals_total: prev.goals_total ?? next.goals_total,
+            goals_met: prev.goals_met ?? next.goals_met,
+            engine_mode: prev.engine_mode ?? next.engine_mode,
+            paused: prev.paused ?? next.paused,
+          };
+        });
+        setPaused((p) => next.paused ?? p);
       })
       .catch(() => {
         // Keep the last rendered task state during a transient poll failure.
@@ -266,11 +276,46 @@ function TaskDetailInner() {
           setLoaded(true);
         }
       });
+    api
+      .stats(id)
+      .then((s) => {
+        const at = s?.active_task;
+        if (!at) return;
+        setTask((prev) => {
+          if (!prev || prev.id !== id) return prev;
+          return {
+            ...prev,
+            in_flight: at.in_flight,
+            goals_total: at.goals_total,
+            goals_met: at.goals_met,
+            engine_mode: s.engine_mode ?? at.engine_mode,
+            paused: at.paused,
+          };
+        });
+        setPaused(at.paused ?? false);
+      })
+      .catch(() => {
+        // Stats are supplemental; header already rendered from task().
+      });
   }, [id]);
   React.useEffect(() => {
-    load();
-    const timer = setInterval(load, 5000);
-    return () => clearInterval(timer);
+    setTask(null);
+    setLoaded(false);
+    setPaused(false);
+    terminalRef.current = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let alive = true;
+    const tick = () => {
+      load();
+      timer = setTimeout(() => {
+        if (alive) tick();
+      }, terminalRef.current ? 30_000 : 5000);
+    };
+    tick();
+    return () => {
+      alive = false;
+      if (timer) clearTimeout(timer);
+    };
   }, [load]);
 
   async function togglePause() {

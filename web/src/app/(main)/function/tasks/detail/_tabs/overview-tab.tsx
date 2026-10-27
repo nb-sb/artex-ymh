@@ -384,39 +384,47 @@ export function OverviewTab({ taskId }: { taskId: string }) {
     }
   };
 
+  const terminalRef = React.useRef(false);
   React.useEffect(() => {
     let cancelled = false;
     let loading = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    terminalRef.current = false;
 
-    const load = async () => {
+    const loadHeader = async () => {
+      try {
+        const [taskResp, statsResp] = await Promise.all([api.task(taskId), api.stats(taskId)]);
+        if (cancelled) return;
+        const activeTask = statsResp.active_task;
+        const next = activeTask
+          ? {
+              ...taskResp,
+              in_flight: activeTask.in_flight,
+              goals_total: activeTask.goals_total,
+              goals_met: activeTask.goals_met,
+              engine_mode: statsResp.engine_mode ?? activeTask.engine_mode,
+              paused: activeTask.paused,
+            }
+          : taskResp;
+        terminalRef.current = ["done", "failed", "timeout"].includes(next.status);
+        setTask(next);
+        setStats(statsResp);
+      } catch {
+        // Header stays on the last good snapshot.
+      }
+    };
+
+    const loadBody = async () => {
       if (loading) return;
       loading = true;
       try {
-        const [taskResp, statsResp, intentsResp, findingsResp] = await Promise.all([
-          api.task(taskId),
-          api.stats(taskId),
+        const [intentsResp, findingsResp] = await Promise.all([
           api.intents(taskId),
-          api.findings(taskId),
+          api.findingsPage({ task: taskId, page: 1, pageSize: 20, sort: "time" }),
         ]);
         if (cancelled) return;
-        const activeTask = statsResp.active_task;
-        setTask(
-          activeTask
-            ? {
-                ...taskResp,
-                in_flight: activeTask.in_flight,
-                goals_total: activeTask.goals_total,
-                goals_met: activeTask.goals_met,
-                engine_mode: statsResp.engine_mode ?? activeTask.engine_mode,
-                paused: activeTask.paused,
-              }
-            : taskResp,
-        );
-        setStats(statsResp);
         setIntents(intentsResp);
-        setFindings(findingsResp);
-        // coverage is independent + may 503 when no asset store — fetch separately so
-        // its failure never blocks the others.
+        setFindings(findingsResp.items);
         api
           .taskCoverage(taskId)
           .then((c) => {
@@ -432,22 +440,35 @@ export function OverviewTab({ taskId }: { taskId: string }) {
       }
     };
 
-    void load();
-    void loadScope();
-    void loadPendingScope();
-    void loadTokens();
-    void loadGoals();
-    void loadConstraints();
-    const timer = setInterval(() => {
-      void load();
+    const tick = async () => {
+      if (typeof document !== "undefined" && document.hidden) {
+        timer = setTimeout(() => void tick(), 10_000);
+        return;
+      }
+      await loadBody();
       void loadTokens();
       void loadGoals();
       void loadConstraints();
       void loadPendingScope();
-    }, 3000);
+      const delay = terminalRef.current ? 30_000 : 10_000;
+      if (!cancelled) timer = setTimeout(() => void tick(), delay);
+    };
+
+    void loadHeader();
+    void loadScope();
+    void tick();
+    const onVisibility = () => {
+      if (!document.hidden) {
+        if (timer) clearTimeout(timer);
+        void loadHeader();
+        void tick();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
     return () => {
       cancelled = true;
-      clearInterval(timer);
+      if (timer) clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [taskId, loadScope, loadTokens, loadGoals, loadConstraints, loadPendingScope]);
 

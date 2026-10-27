@@ -95,8 +95,7 @@ export default function LogsPage() {
 
   // Live tail via SSE. on connect, replays whatever is in the ring (includes
   // DB-restored history from the last 100 rows written before restart).
-  // F6:凭据是 60s 一次性 ticket,EventSource 自带的自动重连第二次握手必然 401,
-  // 所以在连接彻底关闭后重新换票重连(seq 去重,重放无害)。
+  // F6:凭据是 60s 一次性 ticket。出错时先 close()，再换票重连。
   React.useEffect(() => {
     if (MOCK) {
       setLines(MOCK_LOGS);
@@ -123,11 +122,11 @@ export default function LogsPage() {
         }
       };
       es.onerror = () => {
-        if (es?.readyState === EventSource.CLOSED && !stopped) {
-          es.close();
-          es = null;
-          timer = setTimeout(connect, 3000);
-        }
+        if (stopped || es == null) return;
+        const current = es;
+        es = null;
+        current.close();
+        timer = setTimeout(connect, 3000);
       };
     };
     void connect();

@@ -69,6 +69,7 @@ import type {
   TokenTotal,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { startVisibleInterval } from "@/lib/visible-interval";
 
 // resolutionLabel names the LLM a session runs on. The badge shows this alone and
 // keeps the model id in its tooltip. Env-backed configs can arrive without a name,
@@ -96,9 +97,9 @@ function fmtBytes(n: number): string {
 //     so refresh / tab-switch / sleep / reconnect never drop the newest records.
 
 const PAGE = 200; // history page size
-const SYSTEM_SCAN_PAGE = 500; // generic activity pages scanned to recover sparse system audit events
 const MAX_KEEP = 4000; // per-session in-memory cap; older pages re-fetched on scroll-up
 const STREAM_WINDOW_MS = 5000; // "live" = activity seen within this window
+const SSE_FLUSH_MS = 100; // coalesce multi-agent SSE frames before React setState
 const MAX_WORKER_MESSAGE_CHARS = 4000;
 
 function newWorkerMessageRequestID(): string {
@@ -634,6 +635,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
   // SSE connection state — surfaced so a dropped realtime link is visible, never
   // silently shown as "no messages".
   const [sseLive, setSseLive] = React.useState(false);
+  const [sseEverOpened, setSseEverOpened] = React.useState(false);
   // Whole-task token total (all agents), polled from the backend aggregate.
   const [taskTokens, setTaskTokens] = React.useState<TokenTotal | null>(null);
   const [sessionTokens, setSessionTokens] = React.useState<Record<string, SessionTokenUsage>>({});
@@ -673,49 +675,6 @@ export function SessionsTab({ taskId }: { taskId: string }) {
       const token = (reqTokenRef.current[key] ?? 0) + 1;
       reqTokenRef.current[key] = token;
       patchStore(key, (s) => ({ ...s, loading: true, error: undefined }));
-
-      if (key === "system") {
-        void (async () => {
-          let since = 0;
-          let systemItems: Activity[] = [];
-          for (;;) {
-            const page = await api.activity(taskId, { since, limit: SYSTEM_SCAN_PAGE });
-            if (reqTokenRef.current[key] !== token) return;
-            systemItems = mergeBySeq(
-              systemItems,
-              page.items.filter(
-                (item) => item.worker === "system" || item.kind === "llm_switch" || item.kind === "llm_failover",
-              ),
-            );
-            if (page.items.length < SYSTEM_SCAN_PAGE || page.cursor <= since) break;
-            since = page.cursor;
-          }
-          patchStore(key, (s) => {
-            const items = mergeBySeq(systemItems, s.items);
-            return {
-              ...s,
-              items,
-              loaded: true,
-              loading: false,
-              hasMore: false,
-              earliestSeq: items.length ? items[0].seq : 0,
-              unread: 0,
-              lastTs: items.length ? items[items.length - 1].ts : s.lastTs,
-              error: undefined,
-            };
-          });
-        })()
-          .catch((error) => {
-            if (reqTokenRef.current[key] !== token) return;
-            patchStore(key, (s) => ({
-              ...s,
-              loading: false,
-              error: (error as Error).message || "加载失败",
-            }));
-          })
-          .finally(() => loadingKeysRef.current.delete(key));
-        return;
-      }
 
       api
         .activityHistory(taskId, key, 0, PAGE)
@@ -782,7 +741,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
   // ── task token total (whole task, all agents) ───────────────────────────────────
   React.useEffect(() => {
     let alive = true;
-    const load = () =>
+    const stop = startVisibleInterval(() => {
       api
         .tokenStats(taskId)
         .then((r) => {
@@ -793,20 +752,19 @@ export function SessionsTab({ taskId }: { taskId: string }) {
         .catch(() => {
           // Polling is best-effort; the next interval retries automatically.
         });
-    void load();
-    const t = setInterval(load, 5000);
+    }, 15_000);
     return () => {
       alive = false;
-      clearInterval(t);
+      stop();
     };
   }, [taskId]);
 
   React.useEffect(() => {
     let alive = true;
     setMainChatRunning(null);
-    const load = () => {
+    const stop = startVisibleInterval(() => {
       const request = ++chatStatusRequestRef.current;
-      return api
+      api
         .chatStatus(taskId)
         .then(({ running }) => {
           if (alive && chatStatusRequestRef.current === request) setMainChatRunning(running);
@@ -815,18 +773,16 @@ export function SessionsTab({ taskId }: { taskId: string }) {
           // Keep the last authoritative value. Before the first success, recent
           // activity remains a conservative fallback.
         });
-    };
-    void load();
-    const timer = setInterval(load, 2000);
+    }, 2000);
     return () => {
       alive = false;
-      clearInterval(timer);
+      stop();
     };
   }, [taskId]);
 
   React.useEffect(() => {
     let alive = true;
-    const load = () =>
+    const stop = startVisibleInterval(() => {
       api
         .taskLLMResolution(taskId)
         .then((value) => {
@@ -835,37 +791,45 @@ export function SessionsTab({ taskId }: { taskId: string }) {
         .catch(() => {
           // Polling is best-effort; the next interval retries automatically.
         });
-    void load();
-    const timer = setInterval(load, 10_000);
+    }, 10_000);
     return () => {
       alive = false;
-      clearInterval(timer);
+      stop();
     };
   }, [taskId]);
 
   React.useEffect(() => {
     let alive = true;
-    const load = () =>
+    const stop = startVisibleInterval(() => {
       api
-        .interceptTask(taskId)
-        .then((rows) => {
-          if (alive) setPendingIntercepts(rows.filter((r) => r.status === "pending"));
+        .interceptTaskPage(taskId, 1, 50, { status: "pending" })
+        .then((r) => {
+          if (alive) setPendingIntercepts(r.items);
         })
         .catch(() => {
           // Polling is best-effort; the next interval retries automatically.
         });
-    void load();
-    const t = setInterval(load, 5000);
+    }, 5000);
     return () => {
       alive = false;
-      clearInterval(t);
+      stop();
     };
   }, [taskId]);
 
-  // Re-render on a timer so "streaming" liveness recomputes as activity goes stale.
+  // Re-render only while at least one session looks live, so the badge/duration
+  // can expire without pushing the whole tree every 1.5s when idle.
   const [, setTick] = React.useState(0);
+  const storeRef = React.useRef(store);
+  storeRef.current = store;
   React.useEffect(() => {
-    const id = setInterval(() => setTick((t) => t + 1), 1500);
+    const id = setInterval(() => {
+      const now = Date.now();
+      const anyLive = Object.values(storeRef.current).some((st) => {
+        const t = Date.parse(st.lastTs);
+        return Number.isFinite(t) && now - t < STREAM_WINDOW_MS;
+      });
+      if (anyLive) setTick((n) => n + 1);
+    }, 1500);
     return () => clearInterval(id);
   }, []);
 
@@ -887,6 +851,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
     setSessionTokens({});
     setLLMResolutions(null);
     setSseLive(false);
+    setSseEverOpened(false);
     setActiveId(MAIN_ID); // a stale worker id from the previous task must not leak in
     setMainSegs([{ seq: 0, created_at: "" }]);
     setCurrentSeg(0);
@@ -936,11 +901,55 @@ export function SessionsTab({ taskId }: { taskId: string }) {
     const token = (reqTokenRef.current.mainboot ?? 0) + 1;
     reqTokenRef.current.mainboot = token;
     let bootKey = mainSessionKey(0);
-    // F6: SSE 凭据是 60s 一次性 ticket(见 api.ts sseUrl),EventSource 自带的
-    // 自动重连第二次握手必然 401——连接彻底关闭后重新换票重连;snapshot 游标
-    // 回放 + mergeBySeq 按 seq 去重补偿空窗,等价于原来的 Last-Event-ID 续传。
+    // F6: SSE 凭据是 60s 一次性 ticket(见 api.ts sseUrl)。出错时浏览器会用同一条
+    // URL 重试,票据已经核销,必须先 close() 再换票。since 用已经收到的最大 seq。
     let sseRetry: ReturnType<typeof setTimeout> | undefined;
     const openStreamRef = { current: null as null | (() => void) };
+    const pendingByKey = new Map<string, Activity[]>();
+    let flushTimer: ReturnType<typeof setTimeout> | undefined;
+    const flushPending = () => {
+      flushTimer = undefined;
+      if (!alive || pendingByKey.size === 0) return;
+      const batch = new Map(pendingByKey);
+      pendingByKey.clear();
+      setStore((prev) => {
+        let next = prev;
+        for (const [k, frames] of batch) {
+          const cur = next[k] ?? emptyState();
+          const activeK = activeKeyRef.current;
+          if (!cur.loaded && !cur.loading && k !== activeK) {
+            const accounting = frames.filter((a) => a.kind === "usage" || a.kind === "result");
+            const accountingItems = accounting.length ? mergeBySeq(cur.items, accounting).slice(-4) : cur.items;
+            const last = frames[frames.length - 1];
+            next = {
+              ...next,
+              [k]: { ...cur, items: accountingItems, lastTs: last.ts, unread: cur.unread + frames.length },
+            };
+            continue;
+          }
+          let items = mergeBySeq(cur.items, frames);
+          let hasMore = cur.hasMore;
+          let earliestSeq = cur.earliestSeq;
+          const trimmable = k !== activeK || atBottomRef.current;
+          if (trimmable && items.length > MAX_KEEP) {
+            items = items.slice(items.length - MAX_KEEP);
+            hasMore = true;
+            earliestSeq = items[0].seq;
+          }
+          const last = frames[frames.length - 1];
+          const unread = k === activeK ? 0 : cur.unread + frames.length;
+          next = { ...next, [k]: { ...cur, items, lastTs: last.ts, unread, hasMore, earliestSeq } };
+        }
+        return next;
+      });
+    };
+    const queueFrame = (a: Activity) => {
+      const k = sessionKeyOf(a);
+      const list = pendingByKey.get(k);
+      if (list) list.push(a);
+      else pendingByKey.set(k, [a]);
+      if (!flushTimer) flushTimer = setTimeout(flushPending, SSE_FLUSH_MS);
+    };
     // Resolve the main-agent segments first, then load the CURRENT segment's history and
     // open the SSE from its snapshot cursor. The SSE tails all segments and routes each
     // frame by session_key (main:<seg>), so switching segments needs no new stream.
@@ -973,7 +982,6 @@ export function SessionsTab({ taskId }: { taskId: string }) {
             unread: 0,
           };
         });
-        // Open the single task SSE from the snapshot cursor.
         openStreamRef.current = () => {
           void sseUrl(
             `/api/exploration/activity/stream?task=${encodeURIComponent(taskId)}&since=${snapshotRef.current}`,
@@ -982,14 +990,18 @@ export function SessionsTab({ taskId }: { taskId: string }) {
               if (!alive) return;
               const es = new EventSource(url);
               esRef.current = es;
-              es.onopen = () => setSseLive(true);
+              es.onopen = () => {
+                setSseLive(true);
+                setSseEverOpened(true);
+              };
               es.onerror = () => {
                 setSseLive(false);
-                // 一次性 ticket 不支持浏览器自动重连(重试即 401);彻底关闭后换票重连。
-                if (es.readyState === EventSource.CLOSED && alive && esRef.current === es) {
-                  esRef.current = null;
-                  sseRetry = setTimeout(() => openStreamRef.current?.(), 3000);
-                }
+                // close() 停掉浏览器对同一张废票据的重试,再换票重连。
+                if (!alive || esRef.current !== es) return;
+                esRef.current = null;
+                es.close();
+                if (sseRetry) clearTimeout(sseRetry);
+                sseRetry = setTimeout(() => openStreamRef.current?.(), 3000);
               };
               es.onmessage = (e) => {
                 let a: Activity;
@@ -998,6 +1010,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
                 } catch {
                   return; // ignore malformed frame
                 }
+                if (a.seq > snapshotRef.current) snapshotRef.current = a.seq;
                 if ((a.kind === "llm_switch" || a.kind === "llm_failover") && !llmToastSeqRef.current.has(a.seq)) {
                   llmToastSeqRef.current.add(a.seq);
                   const transition = a.metadata?.llm_transition;
@@ -1017,36 +1030,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
                       // The periodic resolver poll will retry if this event-triggered refresh fails.
                     });
                 }
-                const k = sessionKeyOf(a);
-                setStore((prev) => {
-                  const cur = prev[k] ?? emptyState();
-                  const activeK = activeKeyRef.current;
-                  // Merge into sessions that are loaded, actively loading, or the current
-                  // view (so returning is instant + a frame that lands mid-load isn't lost).
-                  // A cold, inactive session also keeps a tiny accounting tail so the
-                  // sidebar can add the latest unfinished usage without loading history.
-                  if (!cur.loaded && !cur.loading && k !== activeK) {
-                    const accountingItems =
-                      a.kind === "usage" || a.kind === "result" ? mergeBySeq(cur.items, [a]).slice(-4) : cur.items;
-                    return {
-                      ...prev,
-                      [k]: { ...cur, items: accountingItems, lastTs: a.ts, unread: cur.unread + 1 },
-                    };
-                  }
-                  let items = mergeBySeq(cur.items, [a]);
-                  // Memory bound: trim oldest when over cap (older re-fetched on scroll-up),
-                  // but never while the user is reading this session's history (scrolled up).
-                  let hasMore = cur.hasMore;
-                  let earliestSeq = cur.earliestSeq;
-                  const trimmable = k !== activeK || atBottomRef.current;
-                  if (trimmable && items.length > MAX_KEEP) {
-                    items = items.slice(items.length - MAX_KEEP);
-                    hasMore = true;
-                    earliestSeq = items[0].seq;
-                  }
-                  const unread = k === activeK ? 0 : cur.unread + 1;
-                  return { ...prev, [k]: { ...cur, items, lastTs: a.ts, unread, hasMore, earliestSeq } };
-                });
+                queueFrame(a);
               };
             })
             .catch(() => {
@@ -1065,6 +1049,8 @@ export function SessionsTab({ taskId }: { taskId: string }) {
     return () => {
       alive = false;
       if (sseRetry) clearTimeout(sseRetry);
+      if (flushTimer) clearTimeout(flushTimer);
+      pendingByKey.clear();
       esRef.current?.close();
       esRef.current = null;
     };
@@ -1072,7 +1058,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
 
   React.useEffect(() => {
     let active = true;
-    const load = () =>
+    const stop = startVisibleInterval(() => {
       api
         .taskIntentAssets(taskId)
         .then((assets) => {
@@ -1081,15 +1067,17 @@ export function SessionsTab({ taskId }: { taskId: string }) {
         .catch(() => {
           // The next poll retries; Worker controls and transcripts remain available.
         });
-    void load();
-    const timer = setInterval(load, 5000);
+    }, 5000);
     return () => {
       active = false;
-      clearInterval(timer);
+      stop();
     };
   }, [taskId]);
 
   // ── worker (intent) session list — paged, poll first page lightly ───────────────
+  const hasRunningIntentRef = React.useRef(false);
+  hasRunningIntentRef.current =
+    intents.some((item) => item.state === "running") || olderIntents.some((item) => item.state === "running");
   React.useEffect(() => {
     let active = true;
     firstIntentsRef.current = [];
@@ -1097,7 +1085,15 @@ export function SessionsTab({ taskId }: { taskId: string }) {
     setOlderIntents([]);
     setFirstIntentsHasMore(false);
     setOlderIntentsHasMore(false);
-    const load = () =>
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const schedule = () => {
+      timer = setTimeout(load, hasRunningIntentRef.current ? 5000 : 15_000);
+    };
+    const load = () => {
+      if (typeof document !== "undefined" && document.hidden) {
+        schedule();
+        return;
+      }
       api
         .intentsPage(taskId, 0, 300)
         .then((r) => {
@@ -1120,12 +1116,23 @@ export function SessionsTab({ taskId }: { taskId: string }) {
         })
         .catch(() => {
           // Polling is best-effort; the next interval retries automatically.
+        })
+        .finally(() => {
+          if (active) schedule();
         });
-    void load();
-    const t = setInterval(load, 5000);
+    };
+    const onVisibility = () => {
+      if (!document.hidden) {
+        if (timer) clearTimeout(timer);
+        load();
+      }
+    };
+    load();
+    document.addEventListener("visibilitychange", onVisibility);
     return () => {
       active = false;
-      clearInterval(t);
+      if (timer) clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [taskId]);
 
@@ -1630,7 +1637,13 @@ export function SessionsTab({ taskId }: { taskId: string }) {
                     "inline-flex items-center gap-1 text-[10px]",
                     sseLive ? "text-emerald-500" : "text-amber-500",
                   )}
-                  title={sseLive ? "实时连接正常" : "实时连接中断，正在自动重连（历史仍可见）"}
+                  title={
+                    sseLive
+                      ? "实时连接正常"
+                      : sseEverOpened
+                        ? "实时连接中断，正在自动重连（历史仍可见）"
+                        : "正在建立实时连接"
+                  }
                 >
                   {sseLive ? (
                     <>
@@ -1640,7 +1653,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
                   ) : (
                     <>
                       <WifiOffIcon className="size-3" />
-                      重连中
+                      {sseEverOpened ? "重连中" : "连接中"}
                     </>
                   )}
                 </span>

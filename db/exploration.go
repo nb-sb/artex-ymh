@@ -879,6 +879,28 @@ func (s *ExplorationStore) Edges(limit int) ([]Edge, error) {
 	return out, rows.Err()
 }
 
+// GraphRevision is a cheap fingerprint of the exploration graph: counts plus the
+// highest node id and edge endpoints. The UI polls this before pulling the full graph.
+type GraphRevision struct {
+	NodeCount int   `json:"node_count"`
+	EdgeCount int   `json:"edge_count"`
+	MaxNodeID int64 `json:"max_node_id"`
+	MaxEdgeKey int64 `json:"max_edge_key"` // max(src_id)+max(dst_id); edges have no serial id
+}
+
+// GraphRevision returns counts and max ids for change detection without shipping
+// the full node/edge payload.
+func (s *ExplorationStore) GraphRevision() (GraphRevision, error) {
+	var r GraphRevision
+	err := s.db.QueryRow(`SELECT
+		(SELECT COUNT(*) FROM exploration_nodes WHERE exploration_id=$1),
+		(SELECT COUNT(*) FROM exploration_edges WHERE exploration_id=$1),
+		COALESCE((SELECT MAX(id) FROM exploration_nodes WHERE exploration_id=$1),0),
+		COALESCE((SELECT MAX(src_id)+MAX(dst_id) FROM exploration_edges WHERE exploration_id=$1),0)`, s.expID).
+		Scan(&r.NodeCount, &r.EdgeCount, &r.MaxNodeID, &r.MaxEdgeKey)
+	return r, err
+}
+
 // FactsYielded returns the ids of fact nodes an intent produced (intent --yields-->
 // fact), oldest first. Used to spell out the round's incremental facts to the planner
 // alongside the finished worker's output. Best-effort: returns nil for an intent with
@@ -1413,6 +1435,7 @@ func (s *ExplorationStore) ActivityListForTerminalIntent(nodeID, sinceID int64, 
 //   - Worker != ""  → filter by worker name (Plan = "planner").
 //     Goal Agent 的第 0 轮拆解也以 worker="planner" 落库，故 Plan 会话完整覆盖 Goal+Planner。
 //   - NodeID != nil → a Worker session, filtered by node_id (= intent id).
+//   - System == true → system audit + LLM switch/failover rows (the System session).
 //
 // A zero value (all empty) matches the whole task (no session filter).
 type ActivitySessionFilter struct {
@@ -1420,6 +1443,7 @@ type ActivitySessionFilter struct {
 	NodeID  *int64
 	Main    bool // main-agent session
 	MainSeg *int // segment for the main session (nil == current, resolved by caller; 0 == original)
+	System  bool // system session (worker=system or llm_switch/llm_failover)
 }
 
 func (f ActivitySessionFilter) cond(argStart int) (string, []any) {
@@ -1435,6 +1459,8 @@ func (f ActivitySessionFilter) cond(argStart int) (string, []any) {
 			return " AND worker='mainagent' AND COALESCE(main_seg,0)=0", nil
 		}
 		return fmt.Sprintf(" AND worker='mainagent' AND main_seg=$%d", argStart), []any{seg}
+	case f.System:
+		return " AND (worker='system' OR kind IN ('llm_switch','llm_failover'))", nil
 	case f.Worker != "":
 		return fmt.Sprintf(" AND worker=$%d", argStart), []any{f.Worker}
 	default:

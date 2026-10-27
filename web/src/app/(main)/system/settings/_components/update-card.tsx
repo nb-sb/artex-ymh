@@ -38,6 +38,12 @@ function humanSize(n?: number): string {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** 更新源由后端写死并随 /api/update/check 下发。只接受 owner/name，再交给 safeHref。 */
+function githubRepoHref(repo: string | undefined): string | undefined {
+  if (!repo || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) return undefined;
+  return safeHref(`https://github.com/${repo}`);
+}
+
 export function UpdateCard() {
   const [info, setInfo] = React.useState<UpdateCheck | null>(null);
   const [checking, setChecking] = React.useState(true);
@@ -196,6 +202,7 @@ export function UpdateCard() {
   const pct = downloading ? Math.max(progress?.percent ?? 0, 0) : 100;
   // html_url 来自 GitHub API 响应,只允许 http(s) 进 href;异常值时不渲染链接。
   const changelogHref = safeHref(info?.html_url);
+  const repoHref = githubRepoHref(info?.repo);
 
   return (
     // 设置页是多列瀑布流布局，卡片自己负责行间距并禁止跨列断开（见 page.tsx 的注释）。
@@ -205,7 +212,22 @@ export function UpdateCard() {
           <DownloadIcon className="size-4" />
           版本与更新
         </CardTitle>
-        <CardDescription>从 GitHub 检查并安装新版本。更新会重启程序，正在运行的任务会被中断。</CardDescription>
+        <CardDescription>
+          从{" "}
+          {repoHref ? (
+            <a
+              href={repoHref}
+              target="_blank"
+              rel="noreferrer"
+              className="font-mono underline-offset-4 hover:underline"
+            >
+              {info?.repo}
+            </a>
+          ) : (
+            <span className="font-mono">{info?.repo ?? "GitHub"}</span>
+          )}{" "}
+          的正式版检查并安装。更新会重启程序，正在运行的任务会被中断。
+        </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
         <div className="flex flex-wrap items-center gap-2 text-sm">

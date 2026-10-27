@@ -338,6 +338,9 @@ CREATE INDEX IF NOT EXISTS idx_act_main_seg ON activity(exploration_id, main_seg
 CREATE INDEX IF NOT EXISTS idx_act_result_usage ON activity(exploration_id, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens)
     WHERE kind='result';
 CREATE INDEX IF NOT EXISTS idx_act_latest ON activity(exploration_id, created_at DESC);
+-- System session history: worker=system rows or LLM failover/switch markers.
+CREATE INDEX IF NOT EXISTS idx_act_system ON activity(exploration_id, id)
+    WHERE worker='system' OR kind IN ('llm_switch','llm_failover');
 
 -- main_sessions records the resettable main-agent conversation segments of a task.
 -- Segment 0 (the original session) is implicit and never stored; this table holds

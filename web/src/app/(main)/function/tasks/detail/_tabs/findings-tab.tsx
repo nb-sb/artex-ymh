@@ -4,11 +4,18 @@ import * as React from "react";
 
 import Link from "next/link";
 
-import { ArrowDownIcon, ArrowUpIcon, ArrowUpRightIcon, ChevronRightIcon } from "lucide-react";
+import {
+  ArrowDownIcon,
+  ArrowUpIcon,
+  ArrowUpRightIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import { StatusBadge } from "@/components/status-badge";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger } from "@/components/ui/select";
 import { api } from "@/lib/api";
@@ -16,11 +23,13 @@ import { useStoredSortPreference } from "@/lib/sort-preference";
 import { statusMeta } from "@/lib/status";
 import type { Finding, FindingStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { startVisibleInterval } from "@/lib/visible-interval";
 
 type FindingSortField = "time";
 
 const FINDING_SORT_FIELDS: readonly FindingSortField[] = ["time"];
 const FINDING_SORT_PREFERENCE_KEY = "artex_task_findings_sort";
+const PAGE_SIZE = 30;
 
 function findingLabel(finding: Finding): string {
   if (finding.name?.trim()) return finding.name;
@@ -139,6 +148,8 @@ function Row({
 
 export function FindingsTab({ taskId }: { taskId: string }) {
   const [findings, setFindings] = React.useState<Finding[]>([]);
+  const [page, setPage] = React.useState(1);
+  const [total, setTotal] = React.useState(0);
   const [sortPreference, setSortPreference] = useStoredSortPreference(
     FINDING_SORT_PREFERENCE_KEY,
     FINDING_SORT_FIELDS,
@@ -147,24 +158,43 @@ export function FindingsTab({ taskId }: { taskId: string }) {
   );
 
   React.useEffect(() => {
-    let active = true;
-    const load = () => {
+    setPage(1);
+  }, [taskId]);
+
+  React.useEffect(() => {
+    let alive = true;
+    const stop = startVisibleInterval(() => {
       api
-        .findings(taskId)
-        .then((fs) => {
-          if (active) setFindings(fs);
+        .findingsPage({
+          task: taskId,
+          page,
+          pageSize: PAGE_SIZE,
+          sort: "time",
+        })
+        .then((r) => {
+          if (!alive) return;
+          const lastPage = Math.max(1, Math.ceil(r.total / PAGE_SIZE));
+          if (page > lastPage) {
+            setPage(lastPage);
+            return;
+          }
+          const items = [...r.items].sort((a, b) => {
+            const compared = Date.parse(a.ts) - Date.parse(b.ts);
+            if (compared !== 0) return sortPreference.direction === "asc" ? compared : -compared;
+            return b.id.localeCompare(a.id, undefined, { numeric: true });
+          });
+          setFindings(items);
+          setTotal(r.total);
         })
         .catch(() => {
           // Keep the last successful snapshot during transient refresh failures.
         });
-    };
-    load();
-    const t = setInterval(load, 3000);
+    }, 10_000);
     return () => {
-      active = false;
-      clearInterval(t);
+      alive = false;
+      stop();
     };
-  }, [taskId]);
+  }, [taskId, page, sortPreference.direction]);
 
   const onStatus = React.useCallback(async (f: Finding, next: FindingStatus) => {
     if (f.inherited || !f.finding_id || next === f.status) return;
@@ -179,19 +209,13 @@ export function FindingsTab({ taskId }: { taskId: string }) {
     }
   }, []);
 
-  const items = findings
-    .filter((f) => f.task_id === taskId || f.inherited)
-    .sort((a, b) => {
-      const compared = Date.parse(a.ts) - Date.parse(b.ts);
-      if (compared !== 0) return sortPreference.direction === "asc" ? compared : -compared;
-      return b.id.localeCompare(a.id, undefined, { numeric: true });
-    });
+  const lastPage = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
   return (
     <Card className="overflow-hidden py-0">
       <CardContent className="px-0">
         <div className="flex items-center border-b px-4 py-2 text-xs text-muted-foreground">
-          <span className="min-w-0 flex-1">漏洞</span>
+          <span className="min-w-0 flex-1">漏洞{total > 0 ? ` · ${total}` : ""}</span>
           <button
             type="button"
             className="inline-flex items-center gap-1 outline-none focus-visible:underline"
@@ -211,11 +235,38 @@ export function FindingsTab({ taskId }: { taskId: string }) {
             )}
           </button>
         </div>
-        {items.map((f) => (
+        {findings.map((f) => (
           <Row key={f.id} f={f} contextTaskId={taskId} onStatus={onStatus} />
         ))}
-        {items.length === 0 && (
+        {findings.length === 0 && (
           <p className="px-4 py-8 text-center text-sm text-muted-foreground">本任务及直接关联任务暂无确认发现。</p>
+        )}
+        {lastPage > 1 && (
+          <div className="flex items-center justify-end gap-2 border-t px-4 py-2">
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={page <= 1}
+              onClick={() => setPage((p) => Math.max(1, p - 1))}
+            >
+              <ChevronLeftIcon />
+              上一页
+            </Button>
+            <span className="text-xs tabular-nums text-muted-foreground">
+              {page} / {lastPage}
+            </span>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={page >= lastPage}
+              onClick={() => setPage((p) => Math.min(lastPage, p + 1))}
+            >
+              下一页
+              <ChevronRightIcon />
+            </Button>
+          </div>
         )}
       </CardContent>
     </Card>

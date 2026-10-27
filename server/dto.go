@@ -521,6 +521,14 @@ func activityDTOs(in []db.Activity) []ActivityDTO {
 	return out
 }
 
+// activityLiveDTO is the SSE frame shape: same as the history list — summary only.
+// Tool/result bodies stay in the DB and are fetched via activityDetail on expand.
+func activityLiveDTO(a db.Activity) ActivityDTO {
+	d := activityDTO(a)
+	d.Detail = ""
+	return d
+}
+
 // ---- Agent (frontend "Agent") — string id ----
 
 type AgentDTO struct {

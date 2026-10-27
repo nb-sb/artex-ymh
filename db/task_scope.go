@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -396,8 +397,9 @@ type CoverageGraphEdge struct {
 
 // CoverageGraphData is the whole graph for one task.
 type CoverageGraphData struct {
-	Nodes []CoverageGraphNode `json:"nodes"`
-	Edges []CoverageGraphEdge `json:"edges"`
+	Nodes     []CoverageGraphNode `json:"nodes"`
+	Edges     []CoverageGraphEdge `json:"edges"`
+	Truncated bool                `json:"truncated,omitempty"` // true when FoldCoverageGraph dropped nodes
 }
 
 func assetKey(id int64) string   { return "a:" + strconv.FormatInt(id, 10) }
@@ -585,6 +587,93 @@ WHERE type='root_domain' AND domain=$1 LIMIT 1`, root).Scan(&id, &companyID)
 		}
 	}
 	return g, nil
+}
+
+// FoldCoverageGraph keeps at most `limit` children per parent+kind group (same
+// rule as the UI), so the first paint only lays out the visible set. limit<=0
+// uses 20. Hidden nodes are dropped from the payload; callers that need them
+// request the unfolded graph.
+func FoldCoverageGraph(g *CoverageGraphData, limit int) *CoverageGraphData {
+	if g == nil {
+		return &CoverageGraphData{Nodes: []CoverageGraphNode{}, Edges: []CoverageGraphEdge{}}
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	byKey := map[string]CoverageGraphNode{}
+	for _, n := range g.Nodes {
+		byKey[n.Key] = n
+	}
+	parentOf := map[string]string{}
+	childrenOf := map[string][]string{}
+	for _, e := range g.Edges {
+		if _, ok := byKey[e.Src]; !ok {
+			continue
+		}
+		if _, ok := byKey[e.Dst]; !ok {
+			continue
+		}
+		if _, seen := parentOf[e.Src]; !seen {
+			parentOf[e.Src] = e.Dst
+		}
+		childrenOf[e.Dst] = append(childrenOf[e.Dst], e.Src)
+	}
+	visible := map[string]bool{}
+	queue := make([]string, 0, len(g.Nodes))
+	for _, n := range g.Nodes {
+		if _, hasParent := parentOf[n.Key]; !hasParent {
+			visible[n.Key] = true
+			queue = append(queue, n.Key)
+		}
+	}
+	for qi := 0; qi < len(queue); qi++ {
+		parent := queue[qi]
+		kids := childrenOf[parent]
+		if len(kids) == 0 {
+			continue
+		}
+		groups := map[string][]CoverageGraphNode{}
+		for _, ck := range kids {
+			cn, ok := byKey[ck]
+			if !ok {
+				continue
+			}
+			groups[cn.Kind] = append(groups[cn.Kind], cn)
+		}
+		for _, arr := range groups {
+			sort.SliceStable(arr, func(i, j int) bool {
+				if arr[i].Tested != arr[j].Tested {
+					return arr[i].Tested
+				}
+				return arr[i].Label < arr[j].Label
+			})
+			if len(arr) > limit {
+				arr = arr[:limit]
+			}
+			for _, c := range arr {
+				if !visible[c.Key] {
+					visible[c.Key] = true
+					queue = append(queue, c.Key)
+				}
+			}
+		}
+	}
+	out := &CoverageGraphData{
+		Nodes: make([]CoverageGraphNode, 0, len(visible)),
+		Edges: make([]CoverageGraphEdge, 0, len(g.Edges)),
+	}
+	for _, n := range g.Nodes {
+		if visible[n.Key] {
+			out.Nodes = append(out.Nodes, n)
+		}
+	}
+	for _, e := range g.Edges {
+		if visible[e.Src] && visible[e.Dst] {
+			out.Edges = append(out.Edges, e)
+		}
+	}
+	out.Truncated = len(out.Nodes) < len(g.Nodes)
+	return out
 }
 
 // coverageNodeLabel picks the human label for a coverage-graph node.

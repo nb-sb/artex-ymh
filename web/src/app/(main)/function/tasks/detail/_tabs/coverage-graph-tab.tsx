@@ -460,6 +460,7 @@ function GraphInner({ taskId, coverageEnabled = true }: { taskId: string; covera
   const [data, setData] = React.useState<{
     nodes: CoverageGraphNode[];
     edges: CoverageGraphEdge[];
+    truncated?: boolean;
   } | null>(null);
   const [expanded, setExpanded] = React.useState<Map<string, number>>(new Map());
   const [selectedAsset, setSelectedAsset] = React.useState<CoverageGraphNode | null>(null);
@@ -475,24 +476,27 @@ function GraphInner({ taskId, coverageEnabled = true }: { taskId: string; covera
     edges: [],
   });
 
-  const fetchGraph = React.useCallback(() => {
-    setLoading(true);
-    api
-      .taskCoverageGraph(taskId)
-      .then((g) => {
-        // 资产覆盖度功能关闭(B1)：仍出图(范围内资产/company 关联依旧可见)，但抹平
-        // tested 状态——不显示测试进度、不做已测高亮。
-        const nodes = coverageEnabled ? (g.nodes ?? []) : (g.nodes ?? []).map((n) => ({ ...n, tested: false }));
-        setData({ nodes, edges: g.edges ?? [] });
-      })
-      .catch(() => {
-        /* 保留上一次数据 */
-      })
-      .finally(() => setLoading(false));
-  }, [taskId, coverageEnabled]);
+  const fetchGraph = React.useCallback(
+    (fold: boolean) => {
+      setLoading(true);
+      api
+        .taskCoverageGraph(taskId, { fold })
+        .then((g) => {
+          // 资产覆盖度功能关闭(B1)：仍出图(范围内资产/company 关联依旧可见)，但抹平
+          // tested 状态——不显示测试进度、不做已测高亮。
+          const nodes = coverageEnabled ? (g.nodes ?? []) : (g.nodes ?? []).map((n) => ({ ...n, tested: false }));
+          setData({ nodes, edges: g.edges ?? [], truncated: !!g.truncated });
+        })
+        .catch(() => {
+          /* 保留上一次数据 */
+        })
+        .finally(() => setLoading(false));
+    },
+    [taskId, coverageEnabled],
+  );
 
   React.useEffect(() => {
-    fetchGraph();
+    fetchGraph(true);
   }, [fetchGraph]);
 
   const { renderNodes, renderEdges } = React.useMemo(
@@ -656,10 +660,28 @@ function GraphInner({ taskId, coverageEnabled = true }: { taskId: string; covera
           ) : (
             <span className="text-muted-foreground">{loading ? "加载中…" : "暂无范围内资产（先锚定任务范围）"}</span>
           )}
-          <Button variant="ghost" size="icon" className="size-6" onClick={fetchGraph} title="刷新">
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-6"
+            onClick={() => fetchGraph(!data?.truncated)}
+            title="刷新"
+          >
             <RefreshCw className={cn("size-3.5", loading && "animate-spin")} />
           </Button>
         </div>
+        {data?.truncated && (
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="w-full"
+            disabled={loading}
+            onClick={() => fetchGraph(false)}
+          >
+            当前为折叠视图，加载完整覆盖图
+          </Button>
+        )}
         <div className="flex flex-wrap gap-x-3 gap-y-1.5">
           {(Object.keys(kindMeta) as Kind[]).map((k) => {
             const m = kindMeta[k];

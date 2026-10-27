@@ -813,6 +813,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/exploration/findings/{id}", s.deleteFinding)
 	mux.HandleFunc("GET /api/exploration/intents", s.intents)
 	mux.HandleFunc("GET /api/exploration/graph", s.explorationGraph)
+	mux.HandleFunc("GET /api/exploration/graph/revision", s.explorationGraphRevision)
 	mux.HandleFunc("GET /api/exploration/activity", s.activity)
 	mux.HandleFunc("GET /api/exploration/activity/history", s.activityHistory)
 	mux.HandleFunc("GET /api/exploration/main-sessions", s.mainSessions)
@@ -1844,6 +1845,11 @@ func (s *Server) taskCoverageGraph(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	// Default: fold large graphs before shipping. ?fold=0 returns the full set
+	// (e.g. after the user expands a fold group in the UI).
+	if r.URL.Query().Get("fold") != "0" {
+		g = db.FoldCoverageGraph(g, 20)
+	}
 	writeJSON(w, 200, g)
 }
 
@@ -2544,6 +2550,42 @@ func taskIntentHistoryPage(store *db.ExplorationStore, before int64, limit int, 
 	}
 }
 
+// explorationGraphRevision returns a cheap fingerprint so the UI can skip a full
+// graph download when nothing changed.
+func (s *Server) explorationGraphRevision(w http.ResponseWriter, r *http.Request) {
+	t := s.m.ResolveTask(r.URL.Query().Get("task"))
+	if t == nil {
+		writeJSON(w, 200, db.GraphRevision{})
+		return
+	}
+	rev, err := t.Store.GraphRevision()
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	sources, err := t.Store.DirectSourceStores()
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	for _, source := range sources {
+		srcRev, srcErr := source.Store.GraphRevision()
+		if srcErr != nil {
+			writeErr(w, 500, srcErr.Error())
+			return
+		}
+		rev.NodeCount += srcRev.NodeCount
+		rev.EdgeCount += srcRev.EdgeCount
+		if srcRev.MaxNodeID > rev.MaxNodeID {
+			rev.MaxNodeID = srcRev.MaxNodeID
+		}
+		if srcRev.MaxEdgeKey > rev.MaxEdgeKey {
+			rev.MaxEdgeKey = srcRev.MaxEdgeKey
+		}
+	}
+	writeJSON(w, 200, rev)
+}
+
 // explorationGraph returns the whole exploration chain (task graph) as nodes+edges.
 func (s *Server) explorationGraph(w http.ResponseWriter, r *http.Request) {
 	t := s.m.ResolveTask(r.URL.Query().Get("task"))
@@ -2617,9 +2659,9 @@ func (s *Server) activity(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"items": activityDTOs(items), "cursor": cursor})
 }
 
-// parseActivitySession maps a stable session key (main | plan | intent:<ID>) to a
-// DB session filter. Goal Agent + Planner both live under worker="planner" (the
-// single Plan session); a Worker session is one intent, keyed by its node id.
+// parseActivitySession maps a stable session key (main | plan | system | intent:<ID>)
+// to a DB session filter. Goal Agent + Planner both live under worker="planner"
+// (the single Plan session); a Worker session is one intent, keyed by its node id.
 func parseActivitySession(sess string) (db.ActivitySessionFilter, bool) {
 	switch {
 	case sess == "" || sess == "main":
@@ -2633,6 +2675,8 @@ func parseActivitySession(sess string) (db.ActivitySessionFilter, bool) {
 		return db.ActivitySessionFilter{Main: true, MainSeg: &seg}, true
 	case sess == "plan":
 		return db.ActivitySessionFilter{Worker: "planner"}, true
+	case sess == "system":
+		return db.ActivitySessionFilter{System: true}, true
 	case strings.HasPrefix(sess, "intent:"):
 		id, err := strconv.ParseInt(strings.TrimPrefix(sess, "intent:"), 10, 64)
 		if err != nil {
@@ -2963,7 +3007,7 @@ func (s *Server) streamActivity(w http.ResponseWriter, r *http.Request) {
 	// Emit a standard SSE id: line so the browser echoes it as Last-Event-ID on
 	// auto-reconnect (see cursor precedence above).
 	sendSSE := func(a db.Activity) {
-		b, _ := json.Marshal(activityDTO(a))
+		b, _ := json.Marshal(activityLiveDTO(a))
 		fmt.Fprintf(w, "id: %d\ndata: %s\n\n", a.ID, b)
 		flusher.Flush()
 	}

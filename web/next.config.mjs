@@ -31,7 +31,8 @@ const nextConfig = {
           images: { unoptimized: true },
         }
       : {
-          // 开发：把 /api/* 反代到 Go 后端（默认 :8787，可用 AUTOPENTEST_API 覆盖）。
+          // 开发：把 /api/* 反代到 Go 后端。端口不写死在浏览器里；
+          // 本地默认 8787，改端口时设 AUTOPENTEST_API。正式运行由页面自己的地址提供接口。
           async rewrites() {
             const backend = process.env.AUTOPENTEST_API ?? "http://localhost:8787";
             return [{ source: "/api/:path*", destination: `${backend}/api/:path*` }];

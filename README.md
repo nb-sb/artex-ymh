@@ -30,7 +30,7 @@ AI 自主渗透测试系统 · 二开版（Go 后端 + Next.js 前端 + PostgreS
 ### 方式一：一键安装脚本
 
 ```bash
-git clone https://github.com/r0th-m/artex-ymh.git
+git clone https://github.com/nb-sb/artex-ymh.git
 cd artex-ymh
 ./install.sh
 ```
@@ -44,7 +44,7 @@ cd artex-ymh
 > **国内网络**：克隆 GitHub、npm、Go 模块可能需要代理/镜像，参考：`git config --global http.proxy socks5h://127.0.0.1:7890`、`npm config set registry https://registry.npmmirror.com`、`go env -w GOPROXY=https://goproxy.cn,direct`。
 
 ```bash
-git clone https://github.com/r0th-m/artex-ymh.git
+git clone https://github.com/nb-sb/artex-ymh.git
 cd artex-ymh
 # 1) 前端静态导出
 cd web && npm ci && npm run build:static && cd ..
@@ -73,7 +73,7 @@ journalctl -u artex -f
 仓库的 `docker-compose.yml` 已配置为**从源码构建二开版镜像**(`Dockerfile.source`：前端构建 → Go 编译 → 工具运行时，全部在 Docker 内完成，宿主无需 Go/Node):
 
 ```bash
-git clone https://github.com/r0th-m/artex-ymh.git
+git clone https://github.com/nb-sb/artex-ymh.git
 cd artex-ymh
 cp .env.example .env   # 填 POSTGRES_PASSWORD(不要用 # 字符)
 docker compose up -d --build

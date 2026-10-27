@@ -313,6 +313,7 @@ export interface CoverageGraphEdge {
 export interface CoverageGraphData {
   nodes: CoverageGraphNode[];
   edges: CoverageGraphEdge[];
+  truncated?: boolean;
 }
 
 // 某资产在本任务探索图里关联到的意图/事实/发现（覆盖图节点抽屉用）。
